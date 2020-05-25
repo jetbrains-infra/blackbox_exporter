@@ -71,3 +71,7 @@ With this `blackbox_exporter` you can have single common section on blackbox.yam
    relabel_configs:
    ...
  ```
+
+### Usage
+Docker images are available on [Docker Hub](https://hub.docker.com/repository/docker/jetbrainsinfra/blackbox_exporter/tags?page=1):  
+`jetbrainsinfra/blackbox_exporter`
