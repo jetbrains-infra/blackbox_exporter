@@ -75,3 +75,11 @@ With this `blackbox_exporter` you can have single common section on blackbox.yam
 ### Usage
 Docker images are available on [Docker Hub](https://hub.docker.com/repository/docker/jetbrainsinfra/blackbox_exporter/tags?page=1):  
 `jetbrainsinfra/blackbox_exporter`
+
+### Build
+```
+~/go/bin/promu crossbuild
+make docker
+docker tag jetbrainsinfra/blackbox-exporter-linux-amd64:master jetbrainsinfra/blackbox_exporter:v0.16.0
+docker push jetbrainsinfra/blackbox_exporter:v0.16.0
+```
