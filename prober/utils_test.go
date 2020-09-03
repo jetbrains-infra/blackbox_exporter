@@ -79,18 +79,8 @@ func checkRegistryLabels(expRes map[string]map[string]string, mfs []*dto.MetricF
 	}
 }
 
-// Create test certificate with specified expiry date
-// Certificate will be self-signed and use localhost/127.0.0.1
-// Generated certificate and key are returned in PEM encoding
-func generateTestCertificate(expiry time.Time, IPAddressSAN bool) ([]byte, []byte) {
-	privatekey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		panic(fmt.Sprintf("Error creating rsa key: %s", err))
-	}
-	publickey := &privatekey.PublicKey
-
-	cert := x509.Certificate{
-		IsCA:                  true,
+func generateCertificateTemplate(expiry time.Time, IPAddressSAN bool) *x509.Certificate {
+	template := &x509.Certificate{
 		BasicConstraintsValid: true,
 		SubjectKeyId:          []byte{1},
 		SerialNumber:          big.NewInt(1),
@@ -102,18 +92,54 @@ func generateTestCertificate(expiry time.Time, IPAddressSAN bool) ([]byte, []byt
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 	}
-	cert.DNSNames = append(cert.DNSNames, "localhost")
+
+	template.DNSNames = append(template.DNSNames, "localhost")
 	if IPAddressSAN {
-		cert.IPAddresses = append(cert.IPAddresses, net.ParseIP("127.0.0.1"))
-		cert.IPAddresses = append(cert.IPAddresses, net.ParseIP("::1"))
+		template.IPAddresses = append(template.IPAddresses, net.ParseIP("127.0.0.1"))
+		template.IPAddresses = append(template.IPAddresses, net.ParseIP("::1"))
 	}
-	derCert, err := x509.CreateCertificate(rand.Reader, &cert, &cert, publickey, privatekey)
+
+	return template
+}
+
+func generateCertificate(template, parent *x509.Certificate, publickey *rsa.PublicKey, privatekey *rsa.PrivateKey) (*x509.Certificate, []byte) {
+	derCert, err := x509.CreateCertificate(rand.Reader, template, template, publickey, privatekey)
 	if err != nil {
 		panic(fmt.Sprintf("Error signing test-certificate: %s", err))
 	}
+	cert, err := x509.ParseCertificate(derCert)
+	if err != nil {
+		panic(fmt.Sprintf("Error parsing test-certificate: %s", err))
+	}
 	pemCert := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derCert})
-	pemKey := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privatekey)})
-	return pemCert, pemKey
+	return cert, pemCert
+
+}
+
+func generateSignedCertificate(template, parentCert *x509.Certificate, parentKey *rsa.PrivateKey) (*x509.Certificate, []byte, *rsa.PrivateKey) {
+	privatekey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(fmt.Sprintf("Error creating rsa key: %s", err))
+	}
+	cert, pemCert := generateCertificate(template, parentCert, &privatekey.PublicKey, parentKey)
+	return cert, pemCert, privatekey
+}
+
+func generateSelfSignedCertificate(template *x509.Certificate) (*x509.Certificate, []byte, *rsa.PrivateKey) {
+	privatekey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		panic(fmt.Sprintf("Error creating rsa key: %s", err))
+	}
+	publickey := &privatekey.PublicKey
+
+	cert, pemCert := generateCertificate(template, template, publickey, privatekey)
+	return cert, pemCert, privatekey
+}
+
+func generateSelfSignedCertificateWithPrivateKey(template *x509.Certificate, privatekey *rsa.PrivateKey) (*x509.Certificate, []byte) {
+	publickey := &privatekey.PublicKey
+	cert, pemCert := generateCertificate(template, template, publickey, privatekey)
+	return cert, pemCert
 }
 
 func TestChooseProtocol(t *testing.T) {
@@ -143,5 +169,85 @@ func TestChooseProtocol(t *testing.T) {
 	}
 	if ip != nil {
 		t.Error("without fallback it should not answer")
+	}
+}
+
+func checkMetrics(expected map[string]map[string]map[string]struct{}, mfs []*dto.MetricFamily, t *testing.T) {
+	type (
+		valueValidation struct {
+			found bool
+		}
+		labelValidation struct {
+			found  bool
+			values map[string]valueValidation
+		}
+		metricValidation struct {
+			found  bool
+			labels map[string]labelValidation
+		}
+	)
+
+	foundMetrics := map[string]metricValidation{}
+
+	for mname, labels := range expected {
+		var mv metricValidation
+		if labels != nil {
+			mv.labels = map[string]labelValidation{}
+			for lname, values := range labels {
+				var lv labelValidation
+				if values != nil {
+					lv.values = map[string]valueValidation{}
+					for vname, _ := range values {
+						lv.values[vname] = valueValidation{}
+					}
+				}
+				mv.labels[lname] = lv
+			}
+		}
+		foundMetrics[mname] = mv
+	}
+
+	for _, mf := range mfs {
+		info, wanted := foundMetrics[mf.GetName()]
+		if !wanted {
+			continue
+		}
+		info.found = true
+		for _, metric := range mf.GetMetric() {
+			if info.labels == nil {
+				continue
+			}
+			for _, lp := range metric.Label {
+				if label, labelWanted := info.labels[lp.GetName()]; labelWanted {
+					label.found = true
+					if label.values != nil {
+						if value, wanted := label.values[lp.GetValue()]; !wanted {
+							t.Fatalf("Unexpected label %s=%s", lp.GetName(), lp.GetValue())
+						} else if value.found {
+							t.Fatalf("Label %s=%s duplicated", lp.GetName(), lp.GetValue())
+						}
+						label.values[lp.GetValue()] = valueValidation{found: true}
+					}
+					info.labels[lp.GetName()] = label
+				}
+			}
+		}
+		foundMetrics[mf.GetName()] = info
+	}
+
+	for mname, m := range foundMetrics {
+		if !m.found {
+			t.Fatalf("metric %s wanted, not found", mname)
+		}
+		for lname, label := range m.labels {
+			if !label.found {
+				t.Fatalf("metric %s, label %s wanted, not found", mname, lname)
+			}
+			for vname, value := range label.values {
+				if !value.found {
+					t.Fatalf("metric %s, label %s, value %s wanted, not found", mname, lname, vname)
+				}
+			}
+		}
 	}
 }

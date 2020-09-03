@@ -23,6 +23,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
+	pconfig "github.com/prometheus/common/config"
 
 	"github.com/prometheus/blackbox_exporter/config"
 )
@@ -125,6 +126,10 @@ func validRcode(rcode int, valid []string, logger log.Logger) bool {
 
 func ProbeDNS(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger log.Logger) bool {
 	var dialProtocol string
+	probeDNSDurationGaugeVec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "probe_dns_duration_seconds",
+		Help: "Duration of DNS request by phase",
+	}, []string{"phase"})
 	probeDNSAnswerRRSGauge := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "probe_dns_answer_rrs",
 		Help: "Returns number of entries in the answer resource record list",
@@ -137,9 +142,25 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 		Name: "probe_dns_additional_rrs",
 		Help: "Returns number of entries in the additional resource record list",
 	})
+
+	for _, lv := range []string{"resolve", "connect", "request"} {
+		probeDNSDurationGaugeVec.WithLabelValues(lv)
+	}
+
+	registry.MustRegister(probeDNSDurationGaugeVec)
 	registry.MustRegister(probeDNSAnswerRRSGauge)
 	registry.MustRegister(probeDNSAuthorityRRSGauge)
 	registry.MustRegister(probeDNSAdditionalRRSGauge)
+
+	qc := uint16(dns.ClassINET)
+	if module.DNS.QueryClass != "" {
+		var ok bool
+		qc, ok = dns.StringToClass[module.DNS.QueryClass]
+		if !ok {
+			level.Error(logger).Log("msg", "Invalid query class", "Class seen", module.DNS.QueryClass, "Existing classes", dns.ClassToString)
+			return false
+		}
+	}
 
 	qt := dns.TypeANY
 	if module.DNS.QueryType != "" {
@@ -156,23 +177,28 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 	if module.DNS.TransportProtocol == "" {
 		module.DNS.TransportProtocol = "udp"
 	}
-	if module.DNS.TransportProtocol == "udp" || module.DNS.TransportProtocol == "tcp" {
-		targetAddr, port, err := net.SplitHostPort(target)
-		if err != nil {
-			// Target only contains host so fallback to default port and set targetAddr as target.
-			port = "53"
-			targetAddr = target
-		}
-		ip, _, err = chooseProtocol(ctx, module.DNS.IPProtocol, module.DNS.IPProtocolFallback, targetAddr, registry, logger)
-		if err != nil {
-			level.Error(logger).Log("msg", "Error resolving address", "err", err)
-			return false
-		}
-		target = net.JoinHostPort(ip.String(), port)
-	} else {
+	if !(module.DNS.TransportProtocol == "udp" || module.DNS.TransportProtocol == "tcp") {
 		level.Error(logger).Log("msg", "Configuration error: Expected transport protocol udp or tcp", "protocol", module.DNS.TransportProtocol)
 		return false
 	}
+
+	targetAddr, port, err := net.SplitHostPort(target)
+	if err != nil {
+		// Target only contains host so fallback to default port and set targetAddr as target.
+		if module.DNS.DNSOverTLS {
+			port = "853"
+		} else {
+			port = "53"
+		}
+		targetAddr = target
+	}
+	ip, lookupTime, err := chooseProtocol(ctx, module.DNS.IPProtocol, module.DNS.IPProtocolFallback, targetAddr, registry, logger)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error resolving address", "err", err)
+		return false
+	}
+	probeDNSDurationGaugeVec.WithLabelValues("resolve").Add(lookupTime)
+	targetIP := net.JoinHostPort(ip.String(), port)
 
 	if ip.IP.To4() == nil {
 		dialProtocol = module.DNS.TransportProtocol + "6"
@@ -180,8 +206,31 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 		dialProtocol = module.DNS.TransportProtocol + "4"
 	}
 
+	if module.DNS.DNSOverTLS {
+		if module.DNS.TransportProtocol == "tcp" {
+			dialProtocol += "-tls"
+		} else {
+			level.Error(logger).Log("msg", "Configuration error: Expected transport protocol tcp for DoT", "protocol", module.DNS.TransportProtocol)
+			return false
+		}
+	}
+
 	client := new(dns.Client)
 	client.Net = dialProtocol
+
+	if module.DNS.DNSOverTLS {
+		tlsConfig, err := pconfig.NewTLSConfig(&module.DNS.TLSConfig)
+		if err != nil {
+			level.Error(logger).Log("msg", "Failed to create TLS configuration", "err", err)
+			return false
+		}
+		if tlsConfig.ServerName == "" {
+			// Use target-hostname as default for TLS-servername.
+			tlsConfig.ServerName = targetAddr
+		}
+
+		client.TLSConfig = tlsConfig
+	}
 
 	// Use configured SourceIPAddress.
 	if len(module.DNS.SourceIPAddress) > 0 {
@@ -200,12 +249,22 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 	}
 
 	msg := new(dns.Msg)
-	msg.SetQuestion(dns.Fqdn(module.DNS.QueryName), qt)
+	msg.Id = dns.Id()
+	msg.RecursionDesired = true
+	msg.Question = make([]dns.Question, 1)
+	msg.Question[0] = dns.Question{dns.Fqdn(module.DNS.QueryName), qt, qc}
 
-	level.Info(logger).Log("msg", "Making DNS query", "target", target, "dial_protocol", dialProtocol, "query", module.DNS.QueryName, "type", qt)
+	level.Info(logger).Log("msg", "Making DNS query", "target", targetIP, "dial_protocol", dialProtocol, "query", module.DNS.QueryName, "type", qt, "class", qc)
 	timeoutDeadline, _ := ctx.Deadline()
 	client.Timeout = time.Until(timeoutDeadline)
-	response, _, err := client.Exchange(msg, target)
+	requestStart := time.Now()
+	response, rtt, err := client.Exchange(msg, targetIP)
+	// The rtt value returned from client.Exchange includes only the time to
+	// exchange messages with the server _after_ the connection is created.
+	// We compute the connection time as the total time for the operation
+	// minus the time for the actual request rtt.
+	probeDNSDurationGaugeVec.WithLabelValues("connect").Set((time.Since(requestStart) - rtt).Seconds())
+	probeDNSDurationGaugeVec.WithLabelValues("request").Set(rtt.Seconds())
 	if err != nil {
 		level.Error(logger).Log("msg", "Error while sending a DNS query", "err", err)
 		return false

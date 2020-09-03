@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -39,11 +40,12 @@ var (
 )
 
 func init() {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	// PID is typically 1 when running in a container; in that case, set
 	// the ICMP echo ID to a random value to avoid potential clashes with
 	// other blackbox_exporter instances. See #411.
 	if pid := os.Getpid(); pid == 1 {
-		icmpID = rand.Intn(1 << 16)
+		icmpID = r.Intn(1 << 16)
 	} else {
 		icmpID = pid & 0xffff
 	}
@@ -51,7 +53,7 @@ func init() {
 	// Start the ICMP echo sequence at a random offset to prevent them from
 	// being in sync when several blackbox_exporter instances are restarted
 	// at the same time. See #411.
-	icmpSequence = uint16(rand.Intn(1 << 16))
+	icmpSequence = uint16(r.Intn(1 << 16))
 }
 
 func getICMPSequence() uint16 {
@@ -97,6 +99,11 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 
 	setupStart := time.Now()
 	level.Info(logger).Log("msg", "Creating socket")
+
+	privileged := true
+	// Unprivileged sockets are supported on Darwin and Linux only.
+	tryUnprivileged := runtime.GOOS == "darwin" || runtime.GOOS == "linux"
+
 	if ip.IP.To4() == nil {
 		requestType = ipv6.ICMPTypeEchoRequest
 		replyType = ipv6.ICMPTypeEchoReply
@@ -104,10 +111,24 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		if srcIP == nil {
 			srcIP = net.ParseIP("::")
 		}
-		icmpConn, err := icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
-		if err != nil {
-			level.Error(logger).Log("msg", "Error listening to socket", "err", err)
-			return
+
+		var icmpConn *icmp.PacketConn
+		if tryUnprivileged {
+			// "udp" here means unprivileged -- not the protocol "udp".
+			icmpConn, err = icmp.ListenPacket("udp6", srcIP.String())
+			if err != nil {
+				level.Debug(logger).Log("msg", "Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
+			} else {
+				privileged = false
+			}
+		}
+
+		if privileged {
+			icmpConn, err = icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
+			if err != nil {
+				level.Error(logger).Log("msg", "Error listening to socket", "err", err)
+				return
+			}
 		}
 
 		socket = icmpConn
@@ -118,13 +139,16 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		if srcIP == nil {
 			srcIP = net.ParseIP("0.0.0.0")
 		}
-		icmpConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
-		if err != nil {
-			level.Error(logger).Log("msg", "Error listening to socket", "err", err)
-			return
-		}
 
 		if module.ICMP.DontFragment {
+			// If the user has set the don't fragment option we cannot use unprivileged
+			// sockets as it is not possible to set IP header level options.
+			icmpConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
+			if err != nil {
+				level.Error(logger).Log("msg", "Error listening to socket", "err", err)
+				return
+			}
+
 			rc, err := ipv4.NewRawConn(icmpConn)
 			if err != nil {
 				level.Error(logger).Log("msg", "Error creating raw connection", "err", err)
@@ -132,11 +156,35 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			}
 			socket = &v4Conn{c: rc, df: true}
 		} else {
+			var icmpConn *icmp.PacketConn
+
+			if tryUnprivileged {
+				icmpConn, err = icmp.ListenPacket("udp4", srcIP.String())
+				if err != nil {
+					level.Debug(logger).Log("msg", "Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
+				} else {
+					privileged = false
+				}
+			}
+
+			if privileged {
+				icmpConn, err = icmp.ListenPacket("ip4:icmp", srcIP.String())
+				if err != nil {
+					level.Error(logger).Log("msg", "Error listening to socket", "err", err)
+					return
+				}
+			}
+
 			socket = icmpConn
 		}
 	}
 
 	defer socket.Close()
+
+	var dst net.Addr = ip
+	if !privileged {
+		dst = &net.UDPAddr{IP: ip.IP, Zone: ip.Zone}
+	}
 
 	var data []byte
 	if module.ICMP.PayloadSize != 0 {
@@ -163,20 +211,34 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		level.Error(logger).Log("msg", "Error marshalling packet", "err", err)
 		return
 	}
+
 	durationGaugeVec.WithLabelValues("setup").Add(time.Since(setupStart).Seconds())
 	level.Info(logger).Log("msg", "Writing out packet")
 	rttStart := time.Now()
-	if _, err = socket.WriteTo(wb, ip); err != nil {
+	if _, err = socket.WriteTo(wb, dst); err != nil {
 		level.Warn(logger).Log("msg", "Error writing to socket", "err", err)
 		return
 	}
 
-	// Reply should be the same except for the message type.
+	// Reply should be the same except for the message type and ID if
+	// unprivileged sockets were used and the kernel used its own.
 	wm.Type = replyType
+	// Unprivileged cannot set IDs on Linux.
+	idUnknown := !privileged && runtime.GOOS == "linux"
+	if idUnknown {
+		body.ID = 0
+	}
 	wb, err = wm.Marshal(nil)
 	if err != nil {
 		level.Error(logger).Log("msg", "Error marshalling packet", "err", err)
 		return
+	}
+
+	if idUnknown {
+		// If the ID is unknown (due to unprivileged sockets) we also cannot know
+		// the checksum in userspace.
+		wb[2] = 0
+		wb[3] = 0
 	}
 
 	rb := make([]byte, 65536)
@@ -196,10 +258,16 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			level.Error(logger).Log("msg", "Error reading from socket", "err", err)
 			continue
 		}
-		if peer.String() != ip.String() {
+		if peer.String() != dst.String() {
 			continue
 		}
-		if replyType == ipv6.ICMPTypeEchoReply {
+		if idUnknown {
+			// Clear the ID from the packet, as the kernel will have replaced it (and
+			// kept track of our packet for us, hence clearing is safe).
+			rb[4] = 0
+			rb[5] = 0
+		}
+		if idUnknown || replyType == ipv6.ICMPTypeEchoReply {
 			// Clear checksum to make comparison succeed.
 			rb[2] = 0
 			rb[3] = 0

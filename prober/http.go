@@ -226,6 +226,19 @@ func (t *transport) GotFirstResponseByte() {
 	t.current.responseStart = time.Now()
 }
 
+// byteCounter implements an io.ReadCloser that keeps track of the total
+// number of bytes it has read.
+type byteCounter struct {
+	io.ReadCloser
+	n int64
+}
+
+func (bc *byteCounter) Read(p []byte) (int, error) {
+	n, err := bc.ReadCloser.Read(p)
+	bc.n += int64(n)
+	return n, err
+}
+
 func ProbeHTTP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger log.Logger) (success bool) {
 	var redirects int
 	var (
@@ -260,6 +273,19 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			Name: "probe_ssl_earliest_cert_expiry",
 			Help: "Returns earliest SSL cert expiry in unixtime",
 		})
+
+		probeSSLLastChainExpiryTimestampSeconds = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "probe_ssl_last_chain_expiry_timestamp_seconds",
+			Help: "Returns last SSL chain expiry in timestamp seconds",
+		})
+
+		probeSSLLastInformation = prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "probe_ssl_last_chain_info",
+				Help: "Contains SSL leaf certificate information",
+			},
+			[]string{"fingerprint_sha256"},
+		)
 
 		probeTLSVersion = prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -309,11 +335,9 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		level.Error(logger).Log("msg", "Could not parse target URL", "err", err)
 		return false
 	}
-	targetHost, targetPort, err := net.SplitHostPort(targetURL.Host)
-	// If split fails, assuming it's a hostname without port part.
-	if err != nil {
-		targetHost = targetURL.Host
-	}
+
+	targetHost := targetURL.Hostname()
+	targetPort := targetURL.Port()
 
 	ip, lookupTime, err := chooseProtocol(ctx, module.HTTP.IPProtocol, module.HTTP.IPProtocolFallback, targetHost, registry, logger)
 	if err != nil {
@@ -447,8 +471,10 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			}
 		}
 
+		byteCounter := &byteCounter{ReadCloser: resp.Body}
+
 		if success && (len(httpConfig.FailIfBodyMatchesRegexp) > 0 || len(httpConfig.FailIfBodyNotMatchesRegexp) > 0) {
-			success = matchRegularExpressions(resp.Body, httpConfig, logger)
+			success = matchRegularExpressions(byteCounter, httpConfig, logger)
 			if success {
 				probeFailedDueToRegex.Set(0)
 			} else {
@@ -457,13 +483,19 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		}
 
 		if resp != nil && !requestErrored {
-			respBodyBytes, err = io.Copy(ioutil.Discard, resp.Body)
+			_, err = io.Copy(ioutil.Discard, byteCounter)
 			if err != nil {
 				level.Info(logger).Log("msg", "Failed to read HTTP response body", "err", err)
 				success = false
 			}
 
-			resp.Body.Close()
+			respBodyBytes = byteCounter.n
+
+			if err := byteCounter.Close(); err != nil {
+				// We have already read everything we could from the server. The error here might be a
+				// TCP error. Log it in case it contains useful information as to what's the problem.
+				level.Info(logger).Log("msg", "Error while closing response from server", "error", err.Error())
+			}
 		}
 
 		// At this point body is fully read and we can write end time.
@@ -491,7 +523,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 				}
 			}
 			if !found {
-				level.Error(logger).Log("msg", "Invalid HTTP version number", "version", httpVersionNumber)
+				level.Error(logger).Log("msg", "Invalid HTTP version number", "version", resp.Proto)
 				success = false
 			}
 		}
@@ -546,9 +578,11 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 
 	if resp.TLS != nil {
 		isSSLGauge.Set(float64(1))
-		registry.MustRegister(probeSSLEarliestCertExpiryGauge, probeTLSVersion)
+		registry.MustRegister(probeSSLEarliestCertExpiryGauge, probeTLSVersion, probeSSLLastChainExpiryTimestampSeconds, probeSSLLastInformation)
 		probeSSLEarliestCertExpiryGauge.Set(float64(getEarliestCertExpiry(resp.TLS).Unix()))
 		probeTLSVersion.WithLabelValues(getTLSVersion(resp.TLS)).Set(1)
+		probeSSLLastChainExpiryTimestampSeconds.Set(float64(getLastChainExpiry(resp.TLS).Unix()))
+		probeSSLLastInformation.WithLabelValues(getFingerprint(resp.TLS)).Set(1)
 		if httpConfig.FailIfSSL {
 			level.Error(logger).Log("msg", "Final request was over SSL")
 			success = false

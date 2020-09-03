@@ -153,9 +153,17 @@ tls_config:
 
 [ transport_protocol: <string> | default = "udp" ] # udp, tcp
 
+# Whether to use DNS over TLS. This only works with TCP.
+[ dns_over_tls: <boolean | default = false> ]
+
+# Configuration for TLS protocol of DNS over TLS probe.
+tls_config:
+  [ <tls_config> ]
+
 query_name: <string>
 
 [ query_type: <string> | default = "ANY" ]
+[ query_class: <string> | default = "IN" ]
 
 # List of valid response codes.
 valid_rcodes:
@@ -216,7 +224,8 @@ validate_additional_rrs:
 # The source IP address.
 [ source_ip_address: <string> ]
 
-# Set the DF-bit in the IP-header. Only works with ip4 and on *nix systems.
+# Set the DF-bit in the IP-header. Only works with ip4, on *nix systems and
+# requires raw sockets (i.e. root or CAP_NET_RAW on Linux).
 [ dont_fragment: <boolean> | default = false ]
 
 # The size of the payload.

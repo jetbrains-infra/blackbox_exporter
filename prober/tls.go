@@ -14,7 +14,9 @@
 package prober
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"time"
 )
 
@@ -26,6 +28,29 @@ func getEarliestCertExpiry(state *tls.ConnectionState) time.Time {
 		}
 	}
 	return earliest
+}
+
+func getFingerprint(state *tls.ConnectionState) string {
+	cert := state.PeerCertificates[0]
+	fingerprint := sha256.Sum256(cert.Raw)
+	return hex.EncodeToString(fingerprint[:])
+}
+
+func getLastChainExpiry(state *tls.ConnectionState) time.Time {
+	lastChainExpiry := time.Time{}
+	for _, chain := range state.VerifiedChains {
+		earliestCertExpiry := time.Time{}
+		for _, cert := range chain {
+			if (earliestCertExpiry.IsZero() || cert.NotAfter.Before(earliestCertExpiry)) && !cert.NotAfter.IsZero() {
+				earliestCertExpiry = cert.NotAfter
+			}
+		}
+		if lastChainExpiry.IsZero() || lastChainExpiry.Before(earliestCertExpiry) {
+			lastChainExpiry = earliestCertExpiry
+		}
+
+	}
+	return lastChainExpiry
 }
 
 func getTLSVersion(state *tls.ConnectionState) string {
