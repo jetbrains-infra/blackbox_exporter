@@ -20,10 +20,10 @@ tarball:
 crossbuild:
     platforms:
         - linux/amd64
-        - linux/386
-        - darwin/amd64
-        - windows/amd64
-        - windows/386
+        # - linux/386
+        # - darwin/amd64
+        # - windows/amd64
+        # - windows/386
 #        - freebsd/amd64
 #        - freebsd/386
 #        - openbsd/amd64
@@ -31,8 +31,8 @@ crossbuild:
 #        - netbsd/amd64
 #        - netbsd/386
 #        - dragonfly/amd64
-        - linux/arm
-        - linux/arm64
+        # - linux/arm
+        # - linux/arm64
 #        - freebsd/arm
 #        - openbsd/arm
 #        - linux/mips64
@@ -40,5 +40,5 @@ crossbuild:
         # Temporarily deactivated as golang.org/x/sys does not have syscalls
         # implemented for that os/platform combination.
         #- netbsd/arm
-        - linux/ppc64
-        - linux/ppc64le
+        # - linux/ppc64
+        # - linux/ppc64le

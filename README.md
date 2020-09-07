@@ -1,7 +1,9 @@
 # Blackbox exporter
-This is fork of https://github.com/prometheus/blackbox_exporter with ability to pass `server_name` as query param. ([declined in upstream](https://github.com/prometheus/blackbox_exporter/issues/624))
+This is fork of https://github.com/prometheus/blackbox_exporter with such changes (link to upstream):
+ - [pass `server_name` as query param](#pass-server_name-as-query-param) ([#642](https://github.com/prometheus/blackbox_exporter/issues/624))
+ - [non-root icmp in docker](#non-root-icmp-in-docker) ([#689](https://github.com/prometheus/blackbox_exporter/issues/689))
 
-### Use case
+### Pass `server_name` as query param
 In case you have to monitor many certificates installed on groups of hosts and being managed separately.
  For example multiple backends behind single Load Balancer, answering by the same name.
  
@@ -72,6 +74,22 @@ With this `blackbox_exporter` you can have single common section on blackbox.yam
    ...
  ```
 
+### Non-root icmp in docker
+You can use `icmp` module with this container and run it as non-root user.  
+Docker example:
+```bash
+$ docker run -d -p 9115:9115 -u 65534 --cap-add=NET_RAW jetbrainsinfra/blackbox_exporter:v0.17.0
+$ curl -s 'localhost:9115/probe?target=127.0.0.1&module=icmp&debug=true'
+```
+Kubernetes example:
+```yaml
+  securityContext:
+    allowPrivilegeEscalation: true
+    capabilities:
+      add:
+        - NET_RAW
+```
+
 ### Usage
 Docker images are available on [Docker Hub](https://hub.docker.com/repository/docker/jetbrainsinfra/blackbox_exporter/tags?page=1):  
 `jetbrainsinfra/blackbox_exporter`
@@ -80,6 +98,6 @@ Docker images are available on [Docker Hub](https://hub.docker.com/repository/do
 ```
 ~/go/bin/promu crossbuild
 make docker
-docker tag jetbrainsinfra/blackbox-exporter-linux-amd64:master jetbrainsinfra/blackbox_exporter:v0.16.0
-docker push jetbrainsinfra/blackbox_exporter:v0.16.0
+docker tag jetbrainsinfra/blackbox-exporter-linux-amd64:master jetbrainsinfra/blackbox_exporter:v0.17.0
+docker push jetbrainsinfra/blackbox_exporter:v0.17.0
 ```
