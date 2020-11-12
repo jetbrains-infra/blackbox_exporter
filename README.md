@@ -34,7 +34,7 @@ In case you have to monitor many certificates installed on groups of hosts and b
  # many groups like this
      - labels:
          service: elk
-         __params_module: [elk]
+         __param_module: [elk]
        targets: # es.domain.local
          - es-logs-node1.domain.local:443
          - es-logs-node2.domain.local:443
@@ -59,8 +59,8 @@ With this `blackbox_exporter` you can have single common section on blackbox.yam
  # many groups like this
      - labels:
          service: elk
-         __params_module: [elk]
-         __params_server_name: [es.domain.local]
+         __param_module: [elk]
+         __param_server_name: [es.domain.local]
        targets: # es.domain.local
          - es-logs-node1.domain.local:443
          - es-logs-node2.domain.local:443
