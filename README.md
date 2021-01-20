@@ -78,7 +78,7 @@ With this `blackbox_exporter` you can have single common section on blackbox.yam
 You can use `icmp` module with this container and run it as non-root user.  
 Docker example:
 ```bash
-$ docker run -d -p 9115:9115 -u 65534 --cap-add=NET_RAW jetbrainsinfra/blackbox_exporter:v0.17.0
+$ docker run -d -p 9115:9115 -u 65534 --cap-add=NET_RAW jetbrainsinfra/blackbox_exporter:v0.18.0
 $ curl -s 'localhost:9115/probe?target=127.0.0.1&module=icmp&debug=true'
 ```
 Kubernetes example:
@@ -98,6 +98,6 @@ Docker images are available on [Docker Hub](https://hub.docker.com/repository/do
 ```
 ~/go/bin/promu crossbuild
 make docker
-docker tag jetbrainsinfra/blackbox-exporter-linux-amd64:master jetbrainsinfra/blackbox_exporter:v0.17.0
-docker push jetbrainsinfra/blackbox_exporter:v0.17.0
+docker tag jetbrainsinfra/blackbox-exporter-linux-amd64:master jetbrainsinfra/blackbox_exporter:v0.18.0
+docker push jetbrainsinfra/blackbox_exporter:v0.18.0
 ```

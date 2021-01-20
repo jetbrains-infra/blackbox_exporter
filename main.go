@@ -85,6 +85,10 @@ func probeHandler(w http.ResponseWriter, r *http.Request, c *config.Config, logg
 			module.TCP.TLSConfig.ServerName = serverName
 		case "http":
 			module.HTTP.HTTPClientConfig.TLSConfig.ServerName = serverName
+			if module.HTTP.Headers == nil {
+				module.HTTP.Headers = make(map[string]string)
+			}
+			module.HTTP.Headers["Host"] = serverName
 		default:
 			http.Error(w, fmt.Sprintf("No server_name for module %q", moduleName), http.StatusBadRequest)
 			return
