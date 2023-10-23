@@ -1,3 +1,12 @@
+This repository is archived, because both changes were eventually merged into upstream.
+ICMP could be used via:  
+```yaml
+securityContext:
+ sysctls:
+  - name: net.ipv4.ping_group_range
+    value: "0 65536"
+```
+
 # Blackbox exporter
 This is fork of https://github.com/prometheus/blackbox_exporter with such changes (link to upstream):
  - [pass `server_name` as query param](#pass-server_name-as-query-param) ([#642](https://github.com/prometheus/blackbox_exporter/issues/624))
